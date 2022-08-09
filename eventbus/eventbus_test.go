@@ -11,6 +11,26 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+type TestEvent struct {
+	eventbus.DefaultEvent
+
+	Data string `json:"data"`
+}
+
+func NewTestEvent(topic string, producer string, data string) *TestEvent {
+	return &TestEvent{
+		DefaultEvent: eventbus.NewDefaultEvent(topic, producer),
+		Data:         data,
+	}
+}
+
+func (e *TestEvent) GetData() interface{} {
+	return e.Data
+}
+
+type TestSubscriber struct {
+}
+
 func TestEventbus(t *testing.T) {
 	mq, err := queue.NewMemMq()
 	assert.NoError(t, err)
@@ -32,18 +52,18 @@ func TestEventbus(t *testing.T) {
 
 	wg.Add(len(testcases))
 
-	for _, testcase := range testcases {
+	for _, tt := range testcases {
 		func(testcase eventbus.Event) {
 			eventbus.Register(testcase.GetTopic(), &eventbus.Subscriber{
 				NewEvent: func() eventbus.Event { return &TestEvent{} },
-				Handler: func(event eventbus.Event) error {
+				HandleEvent: func(event eventbus.Event) error {
 					atomic.AddInt32(&count, 1)
 					defer wg.Done()
 					assert.Equal(t, testcase.GetData(), (event.(*TestEvent)).GetData())
 					return nil
 				},
 			})
-		}(testcase)
+		}(tt)
 	}
 
 	for _, testcase := range testcases {

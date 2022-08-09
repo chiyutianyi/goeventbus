@@ -7,8 +7,6 @@ import (
 	"sync"
 
 	log "github.com/sirupsen/logrus"
-
-	"github.com/chiyutianyi/goeventbus/queue"
 )
 
 var e *EventBus
@@ -42,8 +40,17 @@ type eventMsg struct {
 	Msg   string `json:"msg"`
 }
 
+// messageQueue is the interface for message queue
+type messageQueue interface {
+	// Publish publishes the event to all subscribers
+	Publish(ctx context.Context, topic, msg string) error
+	// Subscribe subscribes to the topic
+	Subscribe(ctx context.Context, topics []string, handler func(topic, msg string) error)
+}
+
 type EventBus struct {
-	mq          queue.MessageQueue
+	sync.RWMutex
+	mq          messageQueue
 	subscribers map[string]*Subscriber
 
 	ch chan eventMsg
@@ -51,7 +58,7 @@ type EventBus struct {
 	workers int
 }
 
-func Initialize(mq queue.MessageQueue, workers int) error {
+func Initialize(mq messageQueue, workers int) error {
 	lock.Lock()
 	defer lock.Unlock()
 	if e != nil {
@@ -79,6 +86,8 @@ func Serve() {
 
 // Register registers the event to the topic
 func (e *EventBus) Register(topic string, subscriber *Subscriber) error {
+	e.Lock()
+	defer e.Unlock()
 	if _, ok := e.subscribers[topic]; ok {
 		return fmt.Errorf("topic %s already registered", topic)
 	}
@@ -92,9 +101,12 @@ func (e *EventBus) handle(topic, msg string) error {
 		ok         bool
 	)
 
+	e.Lock()
 	if subscriber, ok = e.subscribers[topic]; !ok {
+		e.Unlock()
 		return fmt.Errorf("topic %s not registered", topic)
 	}
+	e.Unlock()
 
 	event := subscriber.NewEvent()
 
@@ -109,7 +121,7 @@ func (e *EventBus) handle(topic, msg string) error {
 
 	eventHandle.Inc()
 	log.Debugf("handle event: %v", msg)
-	if err := subscriber.Handler(event); err != nil {
+	if err := subscriber.HandleEvent(event); err != nil {
 		return fmt.Errorf("handle evetn %s : %s", msg, err)
 	}
 	return nil
@@ -121,9 +133,11 @@ func (e *EventBus) Serve(workers int) {
 
 	topics := []string{}
 
+	e.Lock()
 	for topic := range e.subscribers {
 		topics = append(topics, topic)
 	}
+	e.Unlock()
 
 	if len(topics) == 0 {
 		log.Infof("no topic to subscribe")

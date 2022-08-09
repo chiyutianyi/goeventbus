@@ -8,6 +8,7 @@ import (
 )
 
 type memoryQueue struct {
+	sync.RWMutex
 	queueMap map[string]chan string
 }
 
@@ -20,10 +21,12 @@ func (e *memoryQueue) Publish(ctx context.Context, topic, msg string) error {
 		queue chan string
 		ok    bool
 	)
+	e.Lock()
 	if queue, ok = e.queueMap[topic]; !ok {
 		queue = make(chan string)
 		e.queueMap[topic] = queue
 	}
+	e.Unlock()
 	go func() { queue <- msg }()
 	return nil
 }
@@ -35,7 +38,16 @@ func (e *memoryQueue) Subscribe(ctx context.Context, topics []string, handle fun
 		go func(topic string) {
 			defer wg.Done()
 			for {
-				msg := <-e.queueMap[topic]
+				e.Lock()
+				q, ok := e.queueMap[topic]
+				if !ok {
+					e.Unlock()
+					log.Warnf("topic %s not found", topic)
+					continue
+				}
+				e.Unlock()
+
+				msg := <-q
 				if err := handle(topic, msg); err != nil {
 					log.Errorf("handle message: %s", err)
 				}
