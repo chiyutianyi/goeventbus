@@ -9,6 +9,18 @@ import (
 	logs "github.com/sirupsen/logrus"
 )
 
+// Eventbus is the interface for event bus
+type Eventbus interface {
+	// Register registers the event to the topic
+	Register(topic string, subscribers ...*Subscriber) error
+	// Post posts the event to the topic
+	Post(ctx context.Context, event Event) error
+	// Serve starts the event bus async
+	Serve(ctx context.Context)
+	// Start starts the event bus
+	Start(ctx context.Context)
+}
+
 type eventMsg struct {
 	Topic string `json:"topic"`
 	Msg   string `json:"msg"`
@@ -22,7 +34,7 @@ type messageQueue interface {
 	Subscribe(ctx context.Context, topics []string, handler func(topic, msg string) error)
 }
 
-type EventBus struct {
+type eventbus struct {
 	sync.RWMutex
 	mq          messageQueue
 	subscribers map[string]map[string]*Subscriber
@@ -33,11 +45,11 @@ type EventBus struct {
 }
 
 // NewEventbus creates the event bus
-func NewEventbus(mq messageQueue, workers int) *EventBus {
+func NewEventbus(mq messageQueue, workers int) Eventbus {
 	if workers <= 0 {
 		workers = 5
 	}
-	return &EventBus{
+	return &eventbus{
 		mq:          mq,
 		subscribers: map[string]map[string]*Subscriber{},
 		ch:          make(chan eventMsg),
@@ -46,7 +58,7 @@ func NewEventbus(mq messageQueue, workers int) *EventBus {
 }
 
 // Post Event
-func (e *EventBus) Post(ctx context.Context, event Event) error {
+func (e *eventbus) Post(ctx context.Context, event Event) error {
 	eventsQueued.Inc()
 	msg, err := json.Marshal(event)
 	if err != nil {
@@ -57,7 +69,7 @@ func (e *EventBus) Post(ctx context.Context, event Event) error {
 }
 
 // Register registers the event to the topic
-func (e *EventBus) Register(topic string, subscribers ...*Subscriber) error {
+func (e *eventbus) Register(topic string, subscribers ...*Subscriber) error {
 	var (
 		subs map[string]*Subscriber
 		ok   bool
@@ -78,7 +90,7 @@ func (e *EventBus) Register(topic string, subscribers ...*Subscriber) error {
 	return nil
 }
 
-func (e *EventBus) handle(topic, msg string) error {
+func (e *eventbus) handle(topic, msg string) error {
 	var (
 		subs map[string]*Subscriber
 		ok   bool
@@ -142,22 +154,22 @@ func (e *EventBus) handle(topic, msg string) error {
 }
 
 // Serve starts the event bus
-func (e *EventBus) Serve(ctx context.Context) {
+func (e *eventbus) Serve(ctx context.Context) {
 	go e.Start(ctx)
 }
 
 // Start starts the event bus
-func (e *EventBus) Start(ctx context.Context) {
+func (e *eventbus) Start(ctx context.Context) {
 	var (
 		wg     = sync.WaitGroup{}
 		topics []string
 	)
 
-	e.Lock()
+	e.RLock()
 	for topic := range e.subscribers {
 		topics = append(topics, topic)
 	}
-	e.Unlock()
+	e.RUnlock()
 
 	if len(topics) == 0 {
 		logs.Infof("no topic to subscribe")

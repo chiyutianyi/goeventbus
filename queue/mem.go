@@ -38,14 +38,14 @@ func (e *memoryQueue) Subscribe(ctx context.Context, topics []string, handle fun
 		go func(topic string) {
 			defer wg.Done()
 			for {
-				e.Lock()
+				e.RLock()
 				q, ok := e.queueMap[topic]
 				if !ok {
-					e.Unlock()
+					e.RUnlock()
 					log.Warnf("topic %s not found", topic)
 					continue
 				}
-				e.Unlock()
+				e.RUnlock()
 
 				msg := <-q
 				if err := handle(topic, msg); err != nil {
