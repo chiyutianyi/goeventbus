@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/chiyutianyi/goeventbus/eventbus"
 	"github.com/chiyutianyi/goeventbus/queue"
@@ -28,49 +29,62 @@ func (e *TestEvent) GetData() interface{} {
 	return e.Data
 }
 
-type TestSubscriber struct {
-}
-
 func TestEventbus(t *testing.T) {
+	var (
+		ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+		wg          = sync.WaitGroup{}
+		count       int32
+	)
+	defer cancel()
+
 	mq, err := queue.NewMemMq()
 	assert.NoError(t, err)
 
-	err = eventbus.Initialize(mq, 5)
+	eb := eventbus.NewEventbus(mq, 5)
 	assert.NoError(t, err)
 
-	go eventbus.Serve()
-
-	ctx := context.Background()
-	wg := sync.WaitGroup{}
-
-	var count int32
+	eb.Serve(ctx)
 
 	testcases := []eventbus.Event{
 		NewTestEvent("topic1", "producer1", "msg1"),
 		NewTestEvent("topic2", "producer2", "msg2"),
 	}
 
-	wg.Add(len(testcases))
+	wg.Add(len(testcases) * 2)
 
 	for _, tt := range testcases {
 		func(testcase eventbus.Event) {
-			eventbus.Register(testcase.GetTopic(), &eventbus.Subscriber{
-				NewEvent: func() eventbus.Event { return &TestEvent{} },
-				HandleEvent: func(event eventbus.Event) error {
-					atomic.AddInt32(&count, 1)
-					defer wg.Done()
-					assert.Equal(t, testcase.GetData(), (event.(*TestEvent)).GetData())
-					return nil
+			assert.NoError(t, eb.Register(testcase.GetTopic(),
+				&eventbus.Subscriber{
+					UID:      func() string { return "subscriber1" },
+					NewEvent: func() eventbus.Event { return &TestEvent{} },
+					HandleEvent: func(event eventbus.Event) error {
+						atomic.AddInt32(&count, 1)
+						defer wg.Done()
+						assert.Equal(t, testcase.GetData(), (event.(*TestEvent)).GetData())
+						assert.Equal(t, testcase.GetProducer(), (event.(*TestEvent)).GetProducer())
+						return nil
+					},
 				},
-			})
+				&eventbus.Subscriber{
+					UID:      func() string { return "subscriber2" },
+					NewEvent: func() eventbus.Event { return &TestEvent{} },
+					HandleEvent: func(event eventbus.Event) error {
+						atomic.AddInt32(&count, 1)
+						defer wg.Done()
+						assert.Equal(t, testcase.GetData(), (event.(*TestEvent)).GetData())
+						assert.Equal(t, testcase.GetProducer(), (event.(*TestEvent)).GetProducer())
+						return nil
+					},
+				}))
 		}(tt)
 	}
 
 	for _, testcase := range testcases {
-		eventbus.Post(ctx, testcase)
+		assert.NoError(t, eb.Post(ctx, testcase))
 	}
 
 	wg.Wait()
 
-	assert.Equal(t, int32(len(testcases)), count)
+	assert.EqualValues(t, len(testcases)*2, count)
 }

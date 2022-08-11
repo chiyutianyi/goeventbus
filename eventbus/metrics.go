@@ -5,17 +5,12 @@ import (
 )
 
 var (
-	eventPost = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "eventbus_post",
-		Help: "post events",
-	})
-	eventHandle = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "eventbus_handle",
-		Help: "handle events",
+	eventsQueued = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "eventbus_queued",
+		Help: "events queued",
 	})
 )
 
 func init() {
-	_ = prometheus.Register(eventPost)
-	_ = prometheus.Register(eventHandle)
+	_ = prometheus.Register(eventsQueued)
 }

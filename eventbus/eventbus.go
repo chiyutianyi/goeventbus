@@ -6,34 +6,8 @@ import (
 	"fmt"
 	"sync"
 
-	log "github.com/sirupsen/logrus"
+	logs "github.com/sirupsen/logrus"
 )
-
-var e *EventBus
-var lock sync.Mutex
-
-// Post Event
-func Post(ctx context.Context, event Event) error {
-	if e == nil {
-		return nil
-	}
-	eventPost.Inc()
-	msg, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("marshal event: %s", err)
-	}
-	log.Debugf("post event %s", msg)
-	return e.mq.Publish(ctx, event.GetTopic(), string(msg))
-}
-
-func Register(topic string, subscriber *Subscriber) error {
-	log.Debugf("Registering topic %s", topic)
-	if e == nil {
-		log.Debugf("event bus not initialized")
-		return nil
-	}
-	return e.Register(topic, subscriber)
-}
 
 type eventMsg struct {
 	Topic string `json:"topic"`
@@ -51,87 +25,133 @@ type messageQueue interface {
 type EventBus struct {
 	sync.RWMutex
 	mq          messageQueue
-	subscribers map[string]*Subscriber
+	subscribers map[string]map[string]*Subscriber
 
 	ch chan eventMsg
 
 	workers int
 }
 
-func Initialize(mq messageQueue, workers int) error {
-	lock.Lock()
-	defer lock.Unlock()
-	if e != nil {
-		return fmt.Errorf("event bus already initialized")
-	}
-	e = &EventBus{
-		mq:          mq,
-		subscribers: map[string]*Subscriber{},
-		ch:          make(chan eventMsg),
-		workers:     workers,
-	}
-	return nil
-}
-
-func Serve() {
-	if e == nil {
-		return
-	}
-	workers := e.workers
+// NewEventbus creates the event bus
+func NewEventbus(mq messageQueue, workers int) *EventBus {
 	if workers <= 0 {
 		workers = 5
 	}
-	go e.Serve(workers)
+	return &EventBus{
+		mq:          mq,
+		subscribers: map[string]map[string]*Subscriber{},
+		ch:          make(chan eventMsg),
+		workers:     workers,
+	}
+}
+
+// Post Event
+func (e *EventBus) Post(ctx context.Context, event Event) error {
+	eventsQueued.Inc()
+	msg, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("marshal event: %s", err)
+	}
+	logs.Debugf("post event %s", msg)
+	return e.mq.Publish(ctx, event.GetTopic(), string(msg))
 }
 
 // Register registers the event to the topic
-func (e *EventBus) Register(topic string, subscriber *Subscriber) error {
+func (e *EventBus) Register(topic string, subscribers ...*Subscriber) error {
+	var (
+		subs map[string]*Subscriber
+		ok   bool
+	)
+	logs.Debugf("Registering topic %s", topic)
 	e.Lock()
 	defer e.Unlock()
-	if _, ok := e.subscribers[topic]; ok {
-		return fmt.Errorf("topic %s already registered", topic)
+	if subs, ok = e.subscribers[topic]; !ok {
+		e.subscribers[topic] = map[string]*Subscriber{}
+		subs = e.subscribers[topic]
 	}
-	e.subscribers[topic] = subscriber
+	for _, subscriber := range subscribers {
+		if _, ok = subs[subscriber.UID()]; ok {
+			panic(fmt.Sprintf("subscriber %s already registered", subscriber.UID()))
+		}
+		subs[subscriber.UID()] = subscriber
+	}
 	return nil
 }
 
 func (e *EventBus) handle(topic, msg string) error {
 	var (
-		subscriber *Subscriber
-		ok         bool
+		subs map[string]*Subscriber
+		ok   bool
 	)
 
-	e.Lock()
-	if subscriber, ok = e.subscribers[topic]; !ok {
-		e.Unlock()
+	e.RLock()
+	if subs, ok = e.subscribers[topic]; !ok {
+		e.RUnlock()
 		return fmt.Errorf("topic %s not registered", topic)
 	}
-	e.Unlock()
+	e.RUnlock()
 
-	event := subscriber.NewEvent()
-
-	if err := json.Unmarshal([]byte(msg), &event); err != nil {
-		return fmt.Errorf("unmarshal message: %s", err)
-	}
-
-	if topic != event.GetTopic() {
-		log.Warnf("dirty topic which should be %s but got %s", topic, event.GetTopic())
+	if len(subs) == 0 {
+		logs.Warnf("no subscriber for topic %s", topic)
 		return nil
 	}
 
-	eventHandle.Inc()
-	log.Debugf("handle event: %v", msg)
-	if err := subscriber.HandleEvent(event); err != nil {
-		return fmt.Errorf("handle evetn %s : %s", msg, err)
+	eventsQueued.Dec()
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(subs))
+	errs := make(chan error, 1)
+
+	for _, sub := range subs {
+		go func(subscriber *Subscriber) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					logs.Errorf("subscriber %s panic: %v", subscriber.UID(), r)
+					errs <- fmt.Errorf("subscriber %s panic: %v", subscriber.UID(), r)
+				}
+			}()
+			event := subscriber.NewEvent()
+
+			if err := json.Unmarshal([]byte(msg), &event); err != nil {
+				logs.Errorf("unmarshal message: %s", err)
+				errs <- err
+				return
+			}
+
+			if topic != event.GetTopic() {
+				logs.Warnf("dirty topic which should be %s but got %s", topic, event.GetTopic())
+				return
+			}
+
+			logs.Debugf("handle event: %v", msg)
+			if err := subscriber.HandleEvent(event); err != nil {
+				logs.Errorf("handle event %s : %s", msg, err)
+				errs <- err
+			}
+		}(sub)
 	}
+
+	wg.Wait()
+
+	if len(errs) > 0 {
+		return fmt.Errorf("handle event: %s", <-errs)
+	}
+
 	return nil
 }
 
-func (e *EventBus) Serve(workers int) {
-	wg := sync.WaitGroup{}
-	ctx := context.Background()
+// Serve starts the event bus
+func (e *EventBus) Serve(ctx context.Context) {
+	go e.Start(ctx)
+}
 
-	topics := []string{}
+// Start starts the event bus
+func (e *EventBus) Start(ctx context.Context) {
+	var (
+		wg     = sync.WaitGroup{}
+		topics []string
+	)
 
 	e.Lock()
 	for topic := range e.subscribers {
@@ -140,11 +160,11 @@ func (e *EventBus) Serve(workers int) {
 	e.Unlock()
 
 	if len(topics) == 0 {
-		log.Infof("no topic to subscribe")
+		logs.Infof("no topic to subscribe")
 		return
 	}
 
-	log.Infof("Subscribing to topics %s", topics)
+	logs.Infof("Subscribing to topics %s", topics)
 	go e.mq.Subscribe(
 		ctx,
 		topics,
@@ -154,17 +174,30 @@ func (e *EventBus) Serve(workers int) {
 		},
 	)
 
-	log.Debugf("Start event bus with %d subscribers", workers)
-	wg.Add(workers)
-	for i := 0; i < workers; i++ {
+	logs.Debugf("Start event bus with %d subscribers", e.workers)
+	wg.Add(e.workers)
+	for i := 0; i < e.workers; i++ {
 		num := i
 		go func() {
 			defer wg.Done()
 			for {
-				msg := <-e.ch
-				log.Debugf("worker %d handling event %s", num, msg)
-				if err := e.handle(msg.Topic, msg.Msg); err != nil {
-					log.Errorf("handle : %s", err)
+				select {
+				case msg := <-e.ch:
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								logs.Errorf("panic in event handler: %s", r)
+							}
+						}()
+						logs.Debugf("worker %d handling event %s", num, msg)
+						if err := e.handle(msg.Topic, msg.Msg); err != nil {
+							logs.Errorf("handle : %s", err)
+						}
+					}()
+				case <-ctx.Done():
+					return
+				default:
+					continue
 				}
 			}
 		}()

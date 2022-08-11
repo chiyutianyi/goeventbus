@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"fmt"
+	"sync"
 )
 
 // MessageQueue is the interface for message queue
@@ -15,9 +16,14 @@ type MessageQueue interface {
 
 type Creator func() (MessageQueue, error)
 
-var provides = make(map[string]Creator)
+var (
+	provides  = make(map[string]Creator)
+	driversMu sync.RWMutex
+)
 
 func Register(name string, creator Creator) {
+	driversMu.Lock()
+	defer driversMu.Unlock()
 	if _, ok := provides[name]; ok {
 		panic(fmt.Sprintf("queue %s already registered", name))
 	}
@@ -29,6 +35,8 @@ func Initialize(mqtype string) (MessageQueue, error) {
 	if mqtype == "" {
 		return nil, fmt.Errorf("message queue type is empty")
 	}
+	driversMu.RLock()
+	defer driversMu.RUnlock()
 	if creator, ok := provides[mqtype]; ok {
 		return creator()
 	}
