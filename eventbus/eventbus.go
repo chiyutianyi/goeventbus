@@ -5,9 +5,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	logs "github.com/sirupsen/logrus"
 )
+
+var (
+	subscriberTimeout = 10 * time.Second
+)
+
+type eventMsg struct {
+	Topic string `json:"topic"`
+	Msg   string `json:"msg"`
+}
+
+// messageQueue is the interface for message queue
+type messageQueue interface {
+	// Publish publishes the event to all Subscribers
+	Publish(ctx context.Context, topic, msg string) error
+	// Subscribe subscribes to the topic
+	Subscribe(ctx context.Context, topics []string, handler func(topic, msg string) error)
+}
 
 // Eventbus is the interface for event bus
 type Eventbus interface {
@@ -17,27 +35,12 @@ type Eventbus interface {
 	Post(ctx context.Context, event Event) error
 	// Serve starts the event bus async
 	Serve(ctx context.Context)
-	// Start starts the event bus
-	Start(ctx context.Context)
-}
-
-type eventMsg struct {
-	Topic string `json:"topic"`
-	Msg   string `json:"msg"`
-}
-
-// messageQueue is the interface for message queue
-type messageQueue interface {
-	// Publish publishes the event to all subscribers
-	Publish(ctx context.Context, topic, msg string) error
-	// Subscribe subscribes to the topic
-	Subscribe(ctx context.Context, topics []string, handler func(topic, msg string) error)
 }
 
 type eventbus struct {
 	sync.RWMutex
 	mq          messageQueue
-	subscribers map[string]map[string]*Subscriber
+	subscribers map[string]*Subscribers
 
 	ch chan eventMsg
 
@@ -51,13 +54,13 @@ func NewEventbus(mq messageQueue, workers int) Eventbus {
 	}
 	return &eventbus{
 		mq:          mq,
-		subscribers: map[string]map[string]*Subscriber{},
-		ch:          make(chan eventMsg),
+		subscribers: map[string]*Subscribers{},
+		ch:          make(chan eventMsg, 1000),
 		workers:     workers,
 	}
 }
 
-// Post Event
+// Post posts the event to the topic
 func (e *eventbus) Post(ctx context.Context, event Event) error {
 	eventsQueued.Inc()
 	msg, err := json.Marshal(event)
@@ -69,31 +72,33 @@ func (e *eventbus) Post(ctx context.Context, event Event) error {
 }
 
 // Register registers the event to the topic
-func (e *eventbus) Register(topic string, subscribers ...*Subscriber) error {
+func (e *eventbus) Register(topic string, ins ...*Subscriber) error {
 	var (
-		subs map[string]*Subscriber
+		subs *Subscribers
 		ok   bool
 	)
 	logs.Debugf("Registering topic %s", topic)
 	e.Lock()
 	defer e.Unlock()
 	if subs, ok = e.subscribers[topic]; !ok {
-		e.subscribers[topic] = map[string]*Subscriber{}
-		subs = e.subscribers[topic]
+		subs = newSubscribers()
+		e.subscribers[topic] = subs
 	}
-	for _, subscriber := range subscribers {
-		if _, ok = subs[subscriber.UID()]; ok {
+	for _, subscriber := range ins {
+		if subs.Contains(subscriber.UID()) {
 			panic(fmt.Sprintf("subscriber %s already registered", subscriber.UID()))
 		}
-		subs[subscriber.UID()] = subscriber
+		subs.Add(subscriber)
 	}
 	return nil
 }
 
 func (e *eventbus) handle(topic, msg string) error {
 	var (
-		subs map[string]*Subscriber
-		ok   bool
+		subs    *Subscribers
+		subsLen int
+		ok      bool
+		wg      sync.WaitGroup
 	)
 
 	e.RLock()
@@ -103,25 +108,24 @@ func (e *eventbus) handle(topic, msg string) error {
 	}
 	e.RUnlock()
 
-	if len(subs) == 0 {
+	if subsLen = subs.Len(); subsLen == 0 {
 		logs.Warnf("no subscriber for topic %s", topic)
 		return nil
 	}
 
 	eventsQueued.Dec()
 
-	wg := sync.WaitGroup{}
-	wg.Add(len(subs))
-	errs := make(chan error, 1)
+	errs := make(chan error, subsLen)
 
-	for _, sub := range subs {
+	subs.Each(func(sub *Subscriber) {
+		wg.Add(1)
 		go func(subscriber *Subscriber) {
-			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
 					logs.Errorf("subscriber %s panic: %v", subscriber.UID(), r)
 					errs <- fmt.Errorf("subscriber %s panic: %v", subscriber.UID(), r)
 				}
+				wg.Done()
 			}()
 			event := subscriber.NewEvent()
 
@@ -136,13 +140,16 @@ func (e *eventbus) handle(topic, msg string) error {
 				return
 			}
 
+			ctx, cancel := context.WithTimeout(context.Background(), subscriberTimeout)
+			defer cancel()
+
 			logs.Debugf("handle event: %v", msg)
-			if err := subscriber.HandleEvent(event); err != nil {
+			if err := subscriber.HandleEvent(ctx, event); err != nil {
 				logs.Errorf("handle event %s : %s", msg, err)
 				errs <- err
 			}
 		}(sub)
-	}
+	})
 
 	wg.Wait()
 
@@ -153,15 +160,10 @@ func (e *eventbus) handle(topic, msg string) error {
 	return nil
 }
 
-// Serve starts the event bus
+// Serve starts the event bus async
 func (e *eventbus) Serve(ctx context.Context) {
-	go e.Start(ctx)
-}
-
-// Start starts the event bus
-func (e *eventbus) Start(ctx context.Context) {
 	var (
-		wg     = sync.WaitGroup{}
+		wg     sync.WaitGroup
 		topics []string
 	)
 
@@ -177,7 +179,7 @@ func (e *eventbus) Start(ctx context.Context) {
 	}
 
 	logs.Infof("Subscribing to topics %s", topics)
-	go e.mq.Subscribe(
+	e.mq.Subscribe(
 		ctx,
 		topics,
 		func(topic, msg string) error {
@@ -185,13 +187,11 @@ func (e *eventbus) Start(ctx context.Context) {
 			return nil
 		},
 	)
-
-	logs.Debugf("Start event bus with %d subscribers", e.workers)
-	wg.Add(e.workers)
+	logs.Debugf("Start event bus with %d Subscribers", e.workers)
 	for i := 0; i < e.workers; i++ {
-		num := i
-		go func() {
-			defer wg.Done()
+		wg.Add(1)
+		go func(num int) {
+			wg.Done()
 			for {
 				select {
 				case msg := <-e.ch:
@@ -212,7 +212,7 @@ func (e *eventbus) Start(ctx context.Context) {
 					continue
 				}
 			}
-		}()
+		}(i)
 	}
 	wg.Wait()
 }

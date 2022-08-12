@@ -1,5 +1,7 @@
 package eventbus
 
+import "context"
+
 // Subscriber is the interface for subscriber
 type Subscriber struct {
 	// UID
@@ -9,5 +11,5 @@ type Subscriber struct {
 	NewEvent func() Event
 
 	// HandleEvent handles the event
-	HandleEvent func(event Event) error
+	HandleEvent func(ctx context.Context, event Event) error
 }

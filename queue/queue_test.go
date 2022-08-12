@@ -39,7 +39,7 @@ func testQueue(t *testing.T, queue queue.MessageQueue) {
 
 	topics := []string{"topic1", "topic2"}
 
-	go queue.Subscribe(ctx, topics, func(topic, msg string) error {
+	queue.Subscribe(ctx, topics, func(topic, msg string) error {
 		defer wg.Done()
 		atomic.AddInt32(&count, 1)
 		switch topic {
@@ -51,8 +51,8 @@ func testQueue(t *testing.T, queue queue.MessageQueue) {
 		return nil
 	})
 
-	queue.Publish(ctx, "topic1", "msg1")
-	queue.Publish(ctx, "topic2", "msg2")
+	go queue.Publish(ctx, "topic1", "msg1")
+	go queue.Publish(ctx, "topic2", "msg2")
 
 	wg.Wait()
 

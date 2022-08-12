@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	log "github.com/sirupsen/logrus"
+	logs "github.com/sirupsen/logrus"
 )
 
 type memoryQueue struct {
@@ -18,38 +18,54 @@ func NewMemMq() (MessageQueue, error) {
 
 func (e *memoryQueue) Publish(ctx context.Context, topic, msg string) error {
 	var (
-		queue chan string
-		ok    bool
+		q  chan string
+		ok bool
 	)
-	e.Lock()
-	if queue, ok = e.queueMap[topic]; !ok {
-		queue = make(chan string)
-		e.queueMap[topic] = queue
+	e.RLock()
+	if q, ok = e.queueMap[topic]; !ok {
+		e.RUnlock()
+		e.Lock()
+		q = make(chan string)
+		e.queueMap[topic] = q
+		e.Unlock()
+	} else {
+		e.RUnlock()
 	}
-	e.Unlock()
-	go func() { queue <- msg }()
+	q <- msg
 	return nil
 }
 
 func (e *memoryQueue) Subscribe(ctx context.Context, topics []string, handle func(topic, msg string) error) {
 	wg := sync.WaitGroup{}
-	wg.Add(len(topics))
 	for _, topic := range topics {
+		wg.Add(1)
 		go func(topic string) {
-			defer wg.Done()
+			wg.Done()
 			for {
-				e.RLock()
+				e.Lock()
 				q, ok := e.queueMap[topic]
 				if !ok {
-					e.RUnlock()
-					log.Warnf("topic %s not found", topic)
+					e.Unlock()
 					continue
 				}
-				e.RUnlock()
+				e.Unlock()
 
-				msg := <-q
-				if err := handle(topic, msg); err != nil {
-					log.Errorf("handle message: %s", err)
+				select {
+				case msg := <-q:
+					func() {
+						defer func() {
+							if err := recover(); err != nil {
+								logs.Errorf("handle message panic: %s", err)
+							}
+						}()
+						if err := handle(topic, msg); err != nil {
+							logs.Errorf("handle message: %s", err)
+						}
+					}()
+				case <-ctx.Done():
+					return
+				default:
+					continue
 				}
 			}
 		}(topic)

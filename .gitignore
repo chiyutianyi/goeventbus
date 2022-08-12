@@ -14,3 +14,4 @@ vendor/
 
 # Others
 .DS_Store
+.vscode
