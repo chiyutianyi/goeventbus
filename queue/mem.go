@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"sync"
+	"time"
 
 	logs "github.com/sirupsen/logrus"
 )
@@ -46,6 +47,7 @@ func (e *memoryQueue) Subscribe(ctx context.Context, topics []string, handle fun
 				q, ok := e.queueMap[topic]
 				if !ok {
 					e.Unlock()
+					<-time.After(time.Millisecond) // sleep a while
 					continue
 				}
 				e.Unlock()
@@ -64,7 +66,7 @@ func (e *memoryQueue) Subscribe(ctx context.Context, topics []string, handle fun
 					}()
 				case <-ctx.Done():
 					return
-				default:
+				case <-time.After(time.Millisecond): // sleep a while
 					continue
 				}
 			}

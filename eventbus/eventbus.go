@@ -208,7 +208,7 @@ func (e *eventbus) Serve(ctx context.Context) {
 					}()
 				case <-ctx.Done():
 					return
-				default:
+				case <-time.After(time.Millisecond): // sleep a while
 					continue
 				}
 			}
