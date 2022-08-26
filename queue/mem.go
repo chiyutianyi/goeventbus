@@ -25,9 +25,12 @@ func (e *memoryQueue) Publish(ctx context.Context, topic, msg string) error {
 	e.RLock()
 	if q, ok = e.queueMap[topic]; !ok {
 		e.RUnlock()
+
 		e.Lock()
-		q = make(chan string)
-		e.queueMap[topic] = q
+		if q, ok = e.queueMap[topic]; !ok {
+			q = make(chan string)
+			e.queueMap[topic] = q
+		}
 		e.Unlock()
 	} else {
 		e.RUnlock()
